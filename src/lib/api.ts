@@ -1,4 +1,4 @@
-export const BASE_API = "https://uo1eruxct3.execute-api.ap-south-1.amazonaws.com";
+export const BASE_API = "https://5tp0xyc2i8.execute-api.ap-south-1.amazonaws.com";
 
 export interface User { id: number; name: string; email: string; created_at: string; }
 export interface Participant { id: number; name: string; }
