@@ -5,7 +5,7 @@ import VideoGrid, { GridParticipant } from "@/components/VideoGrid";
 import MeetingControls from "@/components/MeetingControls";
 import ChatPanel from "@/components/ChatPanel";
 import ParticipantPanel from "@/components/ParticipantPanel";
-import { BASE_API, getToken, getUser, joinMeeting as apiJoin, listParticipants as apiList, getChat as apiGetChat, wsUrl, getTurn, endMeeting as apiEnd } from "@/lib/api";
+import { getToken, getUser, joinMeeting, listParticipants, getChat, wsUrl, getTurn, clearAuth, testWebSocketConnectionWithFallback, endMeeting } from "@/lib/api";
 
 const Meeting = () => {
   const { code } = useParams();
@@ -80,19 +80,115 @@ const Meeting = () => {
     const token = getToken();
     if (!token) { navigate('/login'); return; }
     (async () => {
+      let wsTestResult; // Declare outside try block
       try {
-        const join = await apiJoin(code);
+        // Test WebSocket connection first with fallback
+        console.log("Testing WebSocket connection with fallback mechanism...");
+        wsTestResult = await testWebSocketConnectionWithFallback(code);
+        console.log("WebSocket test result:", wsTestResult);
+        
+        // Provide more specific error messages based on error codes
+        if (!wsTestResult.success) {
+          console.error("WebSocket connection test failed:", wsTestResult.error);
+          let errorMessage = "Failed to connect to meeting server. ";
+          
+          // Add details if available
+          if (wsTestResult.details) {
+            console.log("Error details:", wsTestResult.details);
+          }
+          
+          switch (wsTestResult.code) {
+            case 1006:
+              errorMessage += "The connection was closed abnormally. This usually indicates the WebSocket endpoint is not properly configured on the backend server or there's a network issue.";
+              if (wsTestResult.details?.reason) {
+                errorMessage += `\nDetails: ${wsTestResult.details.reason}`;
+              }
+              if (wsTestResult.details?.wasClean === false) {
+                errorMessage += "\nThis suggests the connection was terminated unexpectedly.";
+              }
+              break;
+            case 4401:
+              errorMessage += "Authentication failed. Please log in again.";
+              clearAuth(); // Clear invalid token
+              break;
+            case 4403:
+              errorMessage += "User not found. Please contact support.";
+              break;
+            case 4404:
+              errorMessage += "Meeting not found or has ended.";
+              break;
+            case 1001:
+              errorMessage += "The endpoint is going away. Please try again later.";
+              break;
+            case 1002:
+              errorMessage += "Protocol error. Please contact support.";
+              break;
+            case 1003:
+              errorMessage += "Invalid data received. Please contact support.";
+              break;
+            case 1004:
+              errorMessage += "Reserved. Please contact support.";
+              break;
+            case 1005:
+              errorMessage += "No status code was actually present. Please contact support.";
+              break;
+            case 1007:
+              errorMessage += "Invalid message data. Please contact support.";
+              break;
+            case 1008:
+              errorMessage += "Policy violation. Please contact support.";
+              break;
+            case 1009:
+              errorMessage += "Message too big. Please contact support.";
+              break;
+            case 1010:
+              errorMessage += "Missing extension. Please contact support.";
+              break;
+            case 1011:
+              errorMessage += "Internal server error. Please contact support.";
+              break;
+            case 1012:
+              errorMessage += "Service restart. Please try again later.";
+              break;
+            case 1013:
+              errorMessage += "Try again later. Please wait and try again.";
+              break;
+            case 1014:
+              errorMessage += "Bad gateway. Please contact support.";
+              break;
+            case 1015:
+              errorMessage += "TLS handshake failed. Please contact support.";
+              break;
+            default:
+              errorMessage += "Please check your network connection and try again.";
+              if (wsTestResult.details) {
+                errorMessage += `\nTechnical details: ${JSON.stringify(wsTestResult.details)}`;
+              }
+          }
+          
+          alert(errorMessage);
+          
+          // Navigate to home for authentication issues or meeting not found
+          if (wsTestResult.code === 4401 || wsTestResult.code === 4403 || wsTestResult.code === 4404) {
+            navigate('/home');
+          }
+          return;
+        }
+
+        const join = await joinMeeting(code);
         setParticipants(join.participants.map(p => ({ id: p.id, name: p.name })));
         // assume first participant returned is host if API includes it; if not, keep null
         // backend enforces host-only on end API; hostId only controls button visibility client-side
         try { const h = (join as any).host_id; if (typeof h === 'number') setHostId(h); } catch {}
-      } catch (e) {
+      } catch (e: any) {
+        console.error("Error joining meeting:", e);
+        alert(`Failed to join meeting: ${e.message || 'Unknown error'}. Please try again.`);
         navigate('/home');
         return;
       }
       // Load chat history (non-fatal if missing)
       try {
-        const hist = await apiGetChat(code);
+        const hist = await getChat(code);
         setMessages(hist.map(h => ({ id: String(h.id), sender: h.name, text: h.message, time: new Date(h.timestamp).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}), isSelf: false })));
       } catch (e) { console.warn('Chat history unavailable', e); }
       // Media: constrain for stability
@@ -110,8 +206,58 @@ const Meeting = () => {
 
       try { const cfg = await getTurn(); rtcServersRef.current = cfg.iceServers || []; } catch {}
 
-      const ws = new WebSocket(wsUrl(code));
+      // Use the URL from the successful test
+      const ws = new WebSocket(wsTestResult.url);
       wsRef.current = ws;
+      
+      ws.onopen = () => {
+        console.log("WebSocket connection established");
+        // proactive offers
+        const current = participantsRef.current;
+        current.forEach(p => { if (!p.isSelf && (me?.id||0) < Number(p.id)) callPeer(Number(p.id)); });
+        resumeAllAudio();
+      };
+      
+      ws.onerror = (error) => {
+        console.error("WebSocket connection error:", error);
+        // Display error message to user
+        alert("Failed to connect to the meeting server. Please check your connection and try again.");
+      };
+      
+      ws.onclose = (event) => {
+        console.log("WebSocket connection closed:", event);
+        
+        // Provide specific error messages based on close codes from backend docs
+        if (event.code !== 1000) { // Normal closure
+          let errorMessage = "Meeting connection was lost. ";
+          
+          switch (event.code) {
+            case 4401:
+              errorMessage += "Authentication failed. Please log in again.";
+              clearAuth(); // Clear invalid token
+              break;
+            case 4403:
+              errorMessage += "User not found. Please contact support.";
+              break;
+            case 4404:
+              errorMessage += "Meeting not found or has ended.";
+              break;
+            case 1006:
+              errorMessage += "Network connection issue. Please check your internet connection and try again.";
+              break;
+            default:
+              errorMessage += "Please check your connection and try again.";
+          }
+          
+          alert(errorMessage);
+          
+          // Navigate to home only for authentication issues or meeting not found
+          if (event.code === 4401 || event.code === 4403 || event.code === 4404) {
+            navigate('/home');
+          }
+        }
+      };
+      
       ws.onmessage = (ev) => {
         try {
           const msg = JSON.parse(ev.data);
@@ -172,13 +318,9 @@ const Meeting = () => {
           if (msg.type === 'offer') handleOffer(msg.sender.id, msg.data.sdp);
           if (msg.type === 'answer') handleAnswer(msg.sender.id, msg.data.sdp);
           if (msg.type === 'ice-candidate') handleCandidate(msg.sender.id, msg.data.candidate);
-        } catch {}
-      };
-      ws.onopen = () => {
-        // proactive offers
-        const current = participantsRef.current;
-        current.forEach(p => { if (!p.isSelf && (me?.id||0) < Number(p.id)) callPeer(Number(p.id)); });
-        resumeAllAudio();
+        } catch (e) {
+          console.error("Error processing WebSocket message:", e);
+        }
       };
     })();
     return () => { try { wsRef.current?.close(); } catch {} };
@@ -229,7 +371,7 @@ const Meeting = () => {
   const handleEndMeeting = async () => {
     if (!code) return;
     try {
-      await apiEnd(code);
+      await endMeeting(code);
       // After successful end, local cleanup and navigate home; others will get meeting-ended via WS
       handleLeaveMeeting();
     } catch (e) {
